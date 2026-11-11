@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 输出结果（HTML 快照、report.json 等，生成物不入库）
+output/
+
+# 虚拟环境
+.venv/
+venv/
