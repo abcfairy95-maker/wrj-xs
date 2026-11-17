@@ -5,49 +5,59 @@ from scipy.sparse.csgraph import dijkstra, minimum_spanning_tree
 
 
 def steiner(rm, case):
+    """骨架由终点决定（MST 在 start+ends 上），卡扣退成 degree-2 waypoint 强制穿行。
+
+    约束：终点是叶子（degree=1）、卡扣是穿行点（degree=2）、分叉只落在自由体素。
+    """
     ends, clips = case['ends'], case['clips']
     n_end = len(ends)
-    # 主干终端 = start + clips；终点作为叶子稍后挂接（避免 MST 把终点当穿行点）
-    trunk_nodes = rm.add_terminals(
-        [case['start']['pos']] + [c['pos'] for c in clips],
-        [None] + [c['dir'] for c in clips])
-    end_nodes = rm.add_terminals([e['pos'] for e in ends], [None] * n_end)
-    # nodes 顺序固定为 start + ends + clips（与 result 组装索引一致）
-    nodes = [trunk_nodes[0]] + end_nodes + trunk_nodes[1:]
 
-    D = rm.pair(trunk_nodes)
-    mst = minimum_spanning_tree(csr_matrix(np.where(np.isfinite(D), D, 0.0))).tocoo()
+    # 1. 终端全部进图；顺序固定为 start + ends + clips（与结果组装索引一致）
+    #    终点/卡扣用低连通度接入，从图结构上杜绝「终端被路径穿过变分叉」：
+    #    start=12 连通（根/主干），end=1 连通（叶子），clip=2 连通（穿行）
+    start_term = rm.add_terminals([case['start']['pos']], n_connect=12)[0]
+    end_terms = rm.add_terminals([e['pos'] for e in ends], n_connect=1)
+    clip_terms = rm.add_terminals([c['pos'] for c in clips], [c['dir'] for c in clips],
+                                  n_connect=2)
+    nodes = [start_term] + end_terms + clip_terms
+    all_terminals = set(nodes)
 
+    # 2. 贪心挂叶子（Prim 变体）：终点依次接到最近的非终端树节点（start 或自由体素）
+    #    终点永远作为叶子接入，从结构上杜绝「终点/卡扣变分叉」
+    tree_nodes = {start_term}
     edges = set()
-    for a, b in zip(mst.row, mst.col):
-        p = rm.path(trunk_nodes[a], trunk_nodes[b])
-        if p:
-            for u, v in zip(p[:-1], p[1:]):
-                edges.add((min(u, v), max(u, v)))
-    # 挂接终点（叶子）：每个终点接到最近的主干树节点
-    tree_nodes = {trunk_nodes[0]}
-    for u, v in edges:
-        tree_nodes.add(u); tree_nodes.add(v)
-    for en in end_nodes:
-        dist, pred = dijkstra(rm.graph(), indices=[en], return_predecessors=True)
-        dist = dist[0]; pred = pred[0]
-        best, best_d = None, np.inf
-        for tn in tree_nodes:
-            if dist[tn] < best_d:
-                best_d, best = dist[tn], tn
-        if best is not None and np.isfinite(best_d):
-            path = [best]; cur = best
-            while cur != en:
-                cur = int(pred[cur])
-                if cur < 0:
-                    break
-                path.append(cur)
-            for u, v in zip(path[:-1], path[1:]):
-                edges.add((min(u, v), max(u, v)))
+    remaining = set(end_terms)
+    while remaining:
+        best = None
+        best_d = np.inf
+        for en in remaining:
+            dist, pred = dijkstra(rm.graph(), indices=[en], return_predecessors=True)
+            dist = dist[0]; pred = pred[0]
+            for tn in tree_nodes:
+                if dist[tn] < best_d:
+                    best_d = dist[tn]
+                    path = [tn]; cur = tn
+                    while cur != en:
+                        cur = int(pred[cur])
+                        if cur < 0:
+                            break
+                        path.append(cur)
+                    best = (en, path)
+        if best is None:
+            break
+        en, path = best
+        for u, v in zip(path[:-1], path[1:]):
+            edges.add((min(u, v), max(u, v)))
+        remaining.discard(en)
+        for node in path:
+            if node not in all_terminals:
+                tree_nodes.add(node)
+
+    # 4. 建父指针 + 每条终点路径
     adj = {}
     for u, v in edges:
         adj.setdefault(u, []).append(v); adj.setdefault(v, []).append(u)
-    root = trunk_nodes[0]
+    root = start_term
     parent = {root: -1}
     st = [root]
     while st:
@@ -64,76 +74,13 @@ def steiner(rm, case):
 
     paths = {}
     for i, e in enumerate(ends):
-        p = walk(end_nodes[i])
+        p = walk(end_terms[i])
         if len(p) > 1 and p[0] == root:
             paths[e['id']] = p
-    # 叶子卡扣改道（保证全覆盖）：先干净改道，失败再绕行兜底
+
+    # 5. 卡扣强穿：每个卡扣作为 degree-2 waypoint 插入最近路径（绕行兜底）
     for j, c in enumerate(clips):
-        cn = nodes[1 + n_end + j]
-        if any(cn in p for p in paths.values()):
-            continue
-        par = parent.get(cn, -1)
-        done = False
-        if par != -1:
-            for eid, p in list(paths.items()):
-                if par not in p:
-                    continue
-                i = p.index(par)
-                for side in (1, -1):
-                    if not (0 <= i + side < len(p)):
-                        continue
-                    seg = rm.path(cn, p[i + side])
-                    if seg is None or par in seg:
-                        continue
-                    paths[eid] = p[:i + 1] + seg + p[i + 2:] if side == 1 \
-                        else p[:i - 1] + seg[::-1] + p[i:]
-                    done = True
-                    break
-                if done:
-                    break
-        if done or any(cn in p for p in paths.values()):
-            continue
-        # 方向感知改道：沿卡扣切向前方，在路径上找能接回去的节点，把叶子卡扣变穿行点
-        if par != -1:
-            d = np.asarray(c['dir'], float)
-            cnpos = rm.pos(cn)
-            for eid, p in list(paths.items()):
-                if par not in p:
-                    continue
-                i = p.index(par)
-                flow = rm.pos(p[min(i + 1, len(p) - 1)]) - cnpos
-                d = d if np.dot(flow, d) >= 0 else -d       # 切向对齐流动方向
-                for k in range(1, min(len(p) - i, 25)):
-                    q = p[i + k]
-                    if np.dot(rm.pos(q) - cnpos, d) <= 0:
-                        break                                # 不再在切向前方
-                    if q in set(nodes):
-                        continue                             # 不跳过多余终端
-                    seg = rm.path(cn, q)
-                    if seg is not None and par not in seg:
-                        paths[eid] = p[:i + 1] + seg + p[i + k + 1:]
-                        done = True
-                        break
-                if done:
-                    break
-        if done or any(cn in p for p in paths.values()):
-            continue
-        # 绕行兜底：插到最近线束点之后再回来
-        best_eid, best_i, best_d = None, None, np.inf
-        for eid, p in paths.items():
-            ds = np.linalg.norm(rm.all()[p] - c['pos'], axis=1)
-            i = int(np.argmin(ds))
-            if ds[i] < best_d:
-                best_d, best_i, best_eid = ds[i], i, eid
-        if best_eid is not None:
-            p = paths[best_eid]; i = best_i
-            nxt = i + 1 if i + 1 < len(p) else i
-            pa, pb = rm.path(p[i], cn), rm.path(cn, p[nxt])
-            if pa is not None and pb is not None:
-                paths[best_eid] = p[:i + 1] + pa[1:] + pb[1:] + p[nxt + 1:]
-    # 最终兜底：前面改道可能被后续卡扣覆盖，再扫一遍，未覆盖的强制绕行插入
-    for j, c in enumerate(clips):
-        cn = nodes[1 + n_end + j]
+        cn = clip_terms[j]
         if any(cn in p for p in paths.values()):
             continue
         best_eid, best_i, best_d = None, None, np.inf
@@ -148,7 +95,8 @@ def steiner(rm, case):
             pa, pb = rm.path(p[i], cn), rm.path(cn, p[nxt])
             if pa is not None and pb is not None:
                 paths[best_eid] = p[:i + 1] + pa[1:] + pb[1:] + p[nxt + 1:]
-    # 从最终线束路径重建树，得到与路径一致的分叉点（叶子改道后 adj 已过期）
+
+    # 6. 从最终线束路径重建树，得到与路径一致的分叉点
     final_edges = set()
     for p in paths.values():
         for u, v in zip(p[:-1], p[1:]):
@@ -157,11 +105,11 @@ def steiner(rm, case):
     for u, v in final_edges:
         final_adj.setdefault(u, []).append(v)
         final_adj.setdefault(v, []).append(u)
-    junctions = {n for n in final_adj if len(final_adj[n]) != 2 and n not in set(nodes)}
+    junctions = {n for n in final_adj if len(final_adj[n]) != 2 and n not in all_terminals}
     junctions |= {cur for path in paths.values()
                   for prev, cur, nxt in zip(path, path[1:], path[2:])
                   if prev == nxt}
-    # 从最终线束路径重建父指针（叶子改道后 parent 已过期）
+    # 从最终线束路径重建父指针
     final_parent = {nodes[0]: -1}
     st = [nodes[0]]
     while st:

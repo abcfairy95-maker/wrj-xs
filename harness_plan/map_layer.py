@@ -83,7 +83,7 @@ class Roadmap:
                 R += [i, j]; C += [j, i]; W += [w, w]
         self.edges.append((np.concatenate(R), np.concatenate(C), np.concatenate(W)))
 
-    def add_terminals(self, pts, dirs=None):
+    def add_terminals(self, pts, dirs=None, n_connect=12):
         start = self.n
         pts = np.atleast_2d(np.asarray(pts, float))
         self.nodes.append(pts)
@@ -91,7 +91,7 @@ class Roadmap:
         for t, p in enumerate(pts):
             ti = start + t
             ds = np.linalg.norm(g - p, axis=1)
-            for gi in np.argsort(ds)[:12]:
+            for gi in np.argsort(ds)[:n_connect]:
                 if ds[gi] > 4 * self.vs:
                     break
                 R += [ti, gi]; C += [gi, ti]; W += [float(ds[gi])] * 2
