@@ -79,12 +79,54 @@ def route(case_dir, voxel=None, input_file=None, out=None, turn_w=30.0,
             used_clips.append(covered)
         topo, hp = build_topology(case, rm, paths, nodes, parent, harness_paths, metrics, unreached,
                                   col=col, clearance=p['clearance'], path_samples=path_samples)
-        excluded, final_minimum = select_spaced_clips(case, topo, used_clips, minimum_distance=60.0)
+        l3 = float(case['prefs'].get('clip_min_spacing_mm', 100))
+        excluded, final_minimum = select_spaced_clips(case, topo, used_clips, minimum_distance=l3)
         if not excluded:
             break
         excluded_clips.extend(excluded)
         removed_ids = {item['clip_id'] for item in excluded}
         case['clips'] = [clip for clip in case['clips'] if clip['id'] not in removed_ids]
+
+    # ===== l5：分叉点离卡扣 ≥40mm（弧长） =====
+    l5 = float(case['prefs'].get('clip_min_distance_to_split_mm', 40))
+    fork_to_clip_violations = []
+    branch_cps = [cp for cp in topo['control_points'] if cp['type'] == 'branch']
+    if branch_cps and topo['clip_points']:
+        from scipy.sparse import csr_matrix as _csr
+        from scipy.sparse.csgraph import dijkstra as _spd
+        R, C, W = [], [], []
+        for seg in topo['segments']:
+            pts = np.asarray(topo['edge_paths'][str(seg['id'])]['path_mm'])
+            a, b = seg['from_cp_id'], seg['to_cp_id']
+            length = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+            R += [a, b]; C += [b, a]; W += [length, length]
+        n = max(max(R, default=0), max(C, default=0)) + 1
+        tree_g = _csr((W, (R, C)), shape=(n, n))
+        clip_cp_ids = [cp['control_point_id'] for cp in topo['clip_points']]
+        branch_ids = [cp['id'] for cp in branch_cps]
+        d = _spd(tree_g, directed=False, indices=branch_ids)[:, clip_cp_ids]
+        for i, b in enumerate(branch_cps):
+            mn = float(d[i].min()) if np.isfinite(d[i]).any() else np.inf
+            if mn < l5:
+                fork_to_clip_violations.append(dict(fork_cp_id=int(b['id']), arc_to_clip_mm=round(float(mn), 2)))
+
+    # ===== l4：相邻卡扣间距 ≤150mm，超了要补扣 =====
+    l4 = float(case['prefs'].get('clip_max_spacing_mm', 150))
+    supplement_gaps = []
+    clip_pos = {cp['control_point_id']: np.asarray(cp['position_mm']) for cp in topo['clip_points']}
+    for hid, path_pts in harness_paths.items():
+        hp_arr = np.asarray(path_pts, float)
+        clips_on = []
+        for cpid, cpos in clip_pos.items():
+            i = int(np.argmin(np.linalg.norm(hp_arr - cpos, axis=1)))
+            if np.linalg.norm(hp_arr[i] - cpos) <= 1e-4:
+                clips_on.append((i, cpid))
+        clips_on.sort()
+        for (i1, id1), (i2, id2) in zip(clips_on, clips_on[1:]):
+            gap = float(np.linalg.norm(np.diff(hp_arr[i1:i2 + 1], axis=0), axis=1).sum())
+            if gap > l4:
+                supplement_gaps.append(dict(harness_id=hid, clip_a=int(id1), clip_b=int(id2),
+                                            gap_mm=round(float(gap), 2), supplement_needed=max(1, int(gap / l4))))
 
     issues = []
     for u in unreached:
@@ -119,7 +161,10 @@ def route(case_dir, voxel=None, input_file=None, out=None, turn_w=30.0,
                                 clip_constraint_summary=dict(used=sum(used_clips),
                                                              total=len(case['clips'])),
                                 clip_constraint_issues=clip_issues,
-                                clip_route_spacing={},
+                                clip_route_spacing=dict(
+                                    l4_max_mm=l4, supplement_gaps=supplement_gaps),
+                                fork_distance_summary=dict(
+                                    l5_min_mm=l5, violations=fork_to_clip_violations),
                                 clip_support_issues=[],
                                 clip_support_summary=dict(used=sum(used_clips),
                                                           total=len(case['clips']))),
