@@ -4,6 +4,49 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra, minimum_spanning_tree
 
 
+def _slide_forks_away_from_clips(rm, paths, nodes, all_terminals, n_end, l5):
+    """把离卡扣 < l5 的分叉点合并到更远的邻居，保证卡扣到分叉 ≥ l5。
+
+    分叉点（degree>=3）若离某卡扣弧长/欧氏距离 < l5，就把它「收缩」到
+    离卡扣最远的那个邻居（分叉点移开，卡扣保持 degree=2 穿行）。
+    """
+    from collections import Counter
+    clip_nodes = set(nodes[1 + n_end:])
+    for _ in range(30):
+        edges = set()
+        for p in paths.values():
+            for u, v in zip(p[:-1], p[1:]):
+                edges.add((min(u, v), max(u, v)))
+        adj = {}
+        for u, v in edges:
+            adj.setdefault(u, []).append(v)
+            adj.setdefault(v, []).append(u)
+        forks = [n for n, nb in adj.items() if len(nb) >= 3 and n not in all_terminals]
+        moved = False
+        for F in forks:
+            d_f = min(float(np.linalg.norm(rm.pos(F) - rm.pos(cn))) for cn in clip_nodes)
+            if d_f >= l5:
+                continue
+            nbs = sorted(adj[F], key=lambda n: -min(float(np.linalg.norm(rm.pos(n) - rm.pos(cn)))
+                                                    for cn in clip_nodes))
+            N = nbs[0]  # 离卡扣最远的邻居
+            for eid, p in list(paths.items()):
+                if F not in p:
+                    continue
+                i = p.index(F)
+                new_p = list(p)
+                if (i > 0 and new_p[i - 1] == N) or (i < len(new_p) - 1 and new_p[i + 1] == N):
+                    del new_p[i]
+                else:
+                    new_p[i] = N
+                paths[eid] = new_p
+            moved = True
+            break
+        if not moved:
+            break
+    return paths
+
+
 def steiner(rm, case):
     """骨架由终点决定（MST 在 start+ends 上），卡扣退成 degree-2 waypoint 强制穿行。
 
@@ -164,6 +207,10 @@ def steiner(rm, case):
             if pa is not None and pb is not None:
                 paths[best_eid] = p[:i + 1] + pa[1:] + pb[1:] + p[nxt + 1:]
 
+    # 5.5 分叉点滑移：把离卡扣 < l5 的分叉点合并到更远的邻居（保证 l5 卡扣到分叉距离）
+    l5 = float(case['prefs'].get('clip_min_distance_to_split_mm', 40))
+    paths = _slide_forks_away_from_clips(rm, paths, nodes, all_terminals, n_end, l5)
+
     # 6. 从最终线束路径重建树，得到与路径一致的分叉点
     final_edges = set()
     for p in paths.values():
@@ -176,7 +223,7 @@ def steiner(rm, case):
     junctions = {n for n in final_adj if len(final_adj[n]) != 2 and n not in all_terminals}
     junctions |= {cur for path in paths.values()
                   for prev, cur, nxt in zip(path, path[1:], path[2:])
-                  if prev == nxt}
+                  if prev == nxt and cur not in all_terminals}
     # 从最终线束路径重建父指针
     final_parent = {nodes[0]: -1}
     st = [nodes[0]]
