@@ -154,7 +154,7 @@ def _position_forks(rm, paths, nodes, all_terminals, n_end, params):
 
 
 def steiner(rm, case):
-    """骨架由终点决定（MST 在 start+ends 上），卡扣退成 degree-2 waypoint 强制穿行。
+    """方法三（终点先行）：MST{start+ends} 终点骨架定接入顺序，卡扣主动插入穿行。
 
     约束：终点是叶子（degree=1）、卡扣是穿行点（degree=2）、分叉只落在自由体素。
     """
@@ -171,87 +171,89 @@ def steiner(rm, case):
     nodes = [start_term] + end_terms + clip_terms
     all_terminals = set(nodes)
 
-    # 2. MST 主干 = {start + clips}：卡扣天然在主干上（= 穿行），分叉落在卡扣的体素上
-    #    终点作为叶子挂接（不参与 MST，避免被当穿行点）
-    trunk_nodes = [start_term] + clip_terms
-    D = rm.pair(trunk_nodes)
-    mst = minimum_spanning_tree(csr_matrix(np.where(np.isfinite(D), D, 0.0))).tocoo()
-    edges = set()
-    for a, b in zip(mst.row, mst.col):
-        p = rm.path(trunk_nodes[a], trunk_nodes[b])
-        if p:
-            for u, v in zip(p[:-1], p[1:]):
-                edges.add((min(u, v), max(u, v)))
-    # 终点挂叶子：接到满足约束的树节点
-    #   硬约束：x 度数≤x、l1 末端分支≥l1（挂点离终点 ≥l1）、l2 建分叉时相邻分叉≥l2
-    #   优先级：先满足 l1 的挂点（分叉点迎合终点移动），兜底取最近
+    # 2. MST {start + ends} 草稿：终点先行，骨架由终点决定接入顺序
     from .fork_constraints import read_fork_params
     _fp = read_fork_params(case)
     _x, _l1, _l2 = _fp['x'], _fp['l1'], _fp['l2']
-    tree_nodes = {start_term}
-    for u, v in edges:
-        tree_nodes.add(u); tree_nodes.add(v)
+    trunk = [start_term] + end_terms
+    D = rm.pair(trunk)
+    mst = minimum_spanning_tree(csr_matrix(np.where(np.isfinite(D), D, 0.0))).tocoo()
+    draft = {}
+    for a, b in zip(mst.row, mst.col):
+        draft.setdefault(int(a), []).append(int(b))
+        draft.setdefault(int(b), []).append(int(a))
+    order, seen, q = [], {0}, [0]
+    while q:
+        u = q.pop(0)
+        for v in sorted(draft.get(u, ())):
+            if v not in seen:
+                seen.add(v); order.append(v - 1); q.append(v)
+    order += [i for i in range(n_end) if i not in order]
+    edges = set()
+    # 3. 终点按 MST 顺序挂叶子（终点=叶子 degree=1，不参与主干分叉）
     deg = {}
-    for u, v in edges:
-        deg[u] = deg.get(u, 0) + 1
-        deg[v] = deg.get(v, 0) + 1
-    for en in end_terms:
-        dist, pred = dijkstra(rm.graph(), indices=[en], return_predecessors=True)
-        dist = dist[0]; pred = pred[0]
-        _nl, _ix, _G = _edges_to_graph(rm, edges)
-        forks_now = [n for n in _nl if deg.get(n, 0) >= 3 and n not in all_terminals]
-        fork_set = set(forks_now)
-        d_fork_tree = _multisource(_G, _ix, forks_now)
+    for idx in order:
+        en = end_terms[idx]
+        if not edges:
+            p = rm.path(start_term, en)
+        else:
+            tree_nodes = {start_term}
+            for u, v in edges:
+                tree_nodes.add(u); tree_nodes.add(v)
+            dist, pred = dijkstra(rm.graph(), indices=[en], return_predecessors=True)
+            dist = dist[0]; pred = pred[0]
+            _nl, _ix, _G = _edges_to_graph(rm, edges)
+            forks_now = [n for n in _nl if deg.get(n, 0) >= 3 and n not in all_terminals]
+            fork_set = set(forks_now)
+            d_fork_tree = _multisource(_G, _ix, forks_now)
 
-        def first_fork_euclid(tn):
-            # 末端分支长度 = en 到「最近分叉」的欧氏（tn 挂上去后自身也是分叉候选）
-            d_tn = float(np.linalg.norm(rm.pos(en) - rm.pos(tn)))
-            cur = tn
-            while cur != en and cur >= 0:
-                if cur in fork_set and cur != tn:
-                    return min(d_tn, float(np.linalg.norm(rm.pos(en) - rm.pos(cur))))
-                cur = int(pred[cur])
-            return d_tn
+            def first_fork_euclid(tn):
+                d_tn = float(np.linalg.norm(rm.pos(en) - rm.pos(tn)))
+                cur = tn
+                while cur != en and cur >= 0:
+                    if cur in fork_set and cur != tn:
+                        return min(d_tn, float(np.linalg.norm(rm.pos(en) - rm.pos(cur))))
+                    cur = int(pred[cur])
+                return d_tn
 
-        best, best_d = None, np.inf
-        _l1_need = _l1 + 2.0  # 欧氏≥l1 再加 2mm 余量，抵消平滑重采样误差
-        # 候选 1：复用现有分叉（degree<x）且末端分支 ≥l1
-        for f in forks_now:
-            if deg.get(f, 0) >= _x:
-                continue
-            if first_fork_euclid(f) < _l1_need:
-                continue
-            if dist[f] < best_d:
-                best_d, best = dist[f], f
-        # 候选 2：新建普通点，末端分支 ≥l1 且 l2（新建分叉离现有分叉 ≥l2）
-        for tn in tree_nodes:
-            if tn in all_terminals or deg.get(tn, 0) >= _x:
-                continue
-            if first_fork_euclid(tn) < _l1_need:
-                continue
-            if deg.get(tn, 0) < 3 and d_fork_tree.get(tn, np.inf) < _l2:
-                continue
-            if dist[tn] < best_d:
-                best_d, best = dist[tn], tn
-        if best is None:
+            best, best_d = None, np.inf
+            _l1_need = _l1 + 2.0
             for f in forks_now:
-                if deg.get(f, 0) >= _x:
+                if deg.get(f, 0) >= _x or first_fork_euclid(f) < _l1_need:
                     continue
                 if dist[f] < best_d:
                     best_d, best = dist[f], f
             for tn in tree_nodes:
                 if tn in all_terminals or deg.get(tn, 0) >= _x:
                     continue
+                if first_fork_euclid(tn) < _l1_need:
+                    continue
+                if deg.get(tn, 0) < 3 and d_fork_tree.get(tn, np.inf) < _l2:
+                    continue
                 if dist[tn] < best_d:
                     best_d, best = dist[tn], tn
-        if best is not None and np.isfinite(best_d):
-            path = [best]; cur = best
-            while cur != en:
-                cur = int(pred[cur])
-                if cur < 0:
-                    break
-                path.append(cur)
-            for u, v in zip(path[:-1], path[1:]):
+            if best is None:
+                for f in forks_now:
+                    if deg.get(f, 0) >= _x:
+                        continue
+                    if dist[f] < best_d:
+                        best_d, best = dist[f], f
+                for tn in tree_nodes:
+                    if tn in all_terminals or deg.get(tn, 0) >= _x:
+                        continue
+                    if dist[tn] < best_d:
+                        best_d, best = dist[tn], tn
+            p = None
+            if best is not None and np.isfinite(best_d):
+                path = [best]; cur = best
+                while cur != en:
+                    cur = int(pred[cur])
+                    if cur < 0:
+                        break
+                    path.append(cur)
+                p = path
+        if p:
+            for u, v in zip(p[:-1], p[1:]):
                 edges.add((min(u, v), max(u, v)))
                 deg[u] = deg.get(u, 0) + 1
                 deg[v] = deg.get(v, 0) + 1
@@ -281,72 +283,7 @@ def steiner(rm, case):
         if len(p) > 1 and p[0] == root:
             paths[e['id']] = p
 
-    # 5. 卡扣强穿（三级改道）：保证每个卡扣被某条终点线束真正穿过
-    #    一级 干净改道 → 二级 方向感知 → 三级 绕行兜底 → 最终兜底
-    for j, c in enumerate(clips):
-        cn = clip_terms[j]
-        if any(cn in p for p in paths.values()):
-            continue
-        par = parent.get(cn, -1)
-        done = False
-        if par != -1:
-            for eid, p in list(paths.items()):
-                if par not in p:
-                    continue
-                i = p.index(par)
-                for side in (1, -1):
-                    if not (0 <= i + side < len(p)):
-                        continue
-                    seg = rm.path(cn, p[i + side])
-                    if seg is None or par in seg:
-                        continue
-                    paths[eid] = p[:i + 1] + seg + p[i + 2:] if side == 1 \
-                        else p[:i - 1] + seg[::-1] + p[i:]
-                    done = True
-                    break
-                if done:
-                    break
-        if done or any(cn in p for p in paths.values()):
-            continue
-        # 方向感知改道：沿卡扣切向前方找能接回去的节点，把叶子卡扣变穿行点
-        if par != -1:
-            d = np.asarray(c['dir'], float)
-            cnpos = rm.pos(cn)
-            for eid, p in list(paths.items()):
-                if par not in p:
-                    continue
-                i = p.index(par)
-                flow = rm.pos(p[min(i + 1, len(p) - 1)]) - cnpos
-                d = d if np.dot(flow, d) >= 0 else -d
-                for k in range(1, min(len(p) - i, 25)):
-                    q = p[i + k]
-                    if np.dot(rm.pos(q) - cnpos, d) <= 0:
-                        break
-                    if q in set(nodes):
-                        continue
-                    seg = rm.path(cn, q)
-                    if seg is not None and par not in seg:
-                        paths[eid] = p[:i + 1] + seg + p[i + k + 1:]
-                        done = True
-                        break
-                if done:
-                    break
-        if done or any(cn in p for p in paths.values()):
-            continue
-        # 绕行兜底：插到最近线束点之后再回来
-        best_eid, best_i, best_d = None, None, np.inf
-        for eid, p in paths.items():
-            ds = np.linalg.norm(rm.all()[p] - c['pos'], axis=1)
-            i = int(np.argmin(ds))
-            if ds[i] < best_d:
-                best_d, best_i, best_eid = ds[i], i, eid
-        if best_eid is not None:
-            p = paths[best_eid]; i = best_i
-            nxt = i + 1 if i + 1 < len(p) else i
-            pa, pb = rm.path(p[i], cn), rm.path(cn, p[nxt])
-            if pa is not None and pb is not None:
-                paths[best_eid] = p[:i + 1] + pa[1:] + pb[1:] + p[nxt + 1:]
-    # 最终兜底：再扫一遍，未覆盖的强制绕行插入
+    # 5. 卡扣主动插入（终点先行：卡扣不在骨架，替换最近线束段 P→C→Q 穿行）
     for j, c in enumerate(clips):
         cn = clip_terms[j]
         if any(cn in p for p in paths.values()):
