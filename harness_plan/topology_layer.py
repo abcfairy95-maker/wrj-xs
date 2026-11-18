@@ -4,32 +4,139 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra, minimum_spanning_tree
 
 
-def _slide_forks_away_from_clips(rm, paths, nodes, all_terminals, n_end, l5):
-    """把离卡扣 < l5 的分叉点合并到更远的邻居，保证卡扣到分叉 ≥ l5。
+def _tree_graph(rm, paths):
+    """把线束路径并集成带权树图，返回 (adj, node_list, idx, G)。边权=相邻体素欧氏距离。"""
+    edges = set()
+    for p in paths.values():
+        for u, v in zip(p[:-1], p[1:]):
+            edges.add((min(u, v), max(u, v)))
+    node_list = sorted({n for e in edges for n in e})
+    idx = {n: i for i, n in enumerate(node_list)}
+    adj = {n: [] for n in node_list}
+    R, C, W = [], [], []
+    for u, v in edges:
+        adj[u].append(v)
+        adj[v].append(u)
+        w = float(np.linalg.norm(rm.pos(u) - rm.pos(v)))
+        R += [idx[u], idx[v]]
+        C += [idx[v], idx[u]]
+        W += [w, w]
+    n = len(node_list)
+    G = csr_matrix((W, (R, C)), shape=(n, n)) if n else csr_matrix((0, 0))
+    return adj, node_list, idx, G
 
-    分叉点（degree>=3）若离某卡扣弧长/欧氏距离 < l5，就把它「收缩」到
-    离卡扣最远的那个邻居（分叉点移开，卡扣保持 degree=2 穿行）。
+
+def _multisource(G, idx, sources):
+    """多源最短路：返回每个节点到最近 source 的弧长（无 source 则 inf）。"""
+    src = [idx[s] for s in sources if s in idx]
+    if not src:
+        return {n: np.inf for n in idx}
+    d = dijkstra(G, directed=False, indices=src, min_only=True)
+    return {n: d[idx[n]] for n in idx}
+
+
+def _edges_to_graph(rm, edges):
+    """边集合 -> (node_list, idx, 带权图)。边权 = 相邻体素欧氏距离。"""
+    node_list = sorted({n for e in edges for n in e})
+    idx = {n: i for i, n in enumerate(node_list)}
+    R, C, W = [], [], []
+    for u, v in edges:
+        w = float(np.linalg.norm(rm.pos(u) - rm.pos(v)))
+        R += [idx[u], idx[v]]
+        C += [idx[v], idx[u]]
+        W += [w, w]
+    n = len(node_list)
+    G = csr_matrix((W, (R, C)), shape=(n, n)) if n else csr_matrix((0, 0))
+    return node_list, idx, G
+
+
+def _root_parent(adj, root):
+    parent = {root: -1}
+    stack = [root]
+    while stack:
+        u = stack.pop()
+        for v in adj.get(u, []):
+            if v not in parent:
+                parent[v] = u
+                stack.append(v)
+    return parent
+
+
+def _position_forks(rm, paths, nodes, all_terminals, n_end, params):
+    """分叉点定位：把违规分叉点滑移（合并到更合适的邻居），满足 l1/l2/l5/x。
+
+    分叉点是自由的（可沿主干移动），卡扣/终点是固定的。所以让分叉点
+    「迎合」卡扣/终点/其他分叉移动，直到满足：
+      l5 卡扣到分叉 ≥ l5、l1 终点到分叉 ≥ l1、l2 分叉间距 ≥ l2、x 度数 ≤ x。
     """
-    from collections import Counter
-    clip_nodes = set(nodes[1 + n_end:])
-    for _ in range(30):
-        edges = set()
-        for p in paths.values():
-            for u, v in zip(p[:-1], p[1:]):
-                edges.add((min(u, v), max(u, v)))
-        adj = {}
-        for u, v in edges:
-            adj.setdefault(u, []).append(v)
-            adj.setdefault(v, []).append(u)
-        forks = [n for n, nb in adj.items() if len(nb) >= 3 and n not in all_terminals]
+    l1, l2, l5, x = params['l1'], params['l2'], params['l5'], params['x']
+    clip_nodes = list(nodes[1 + n_end:])
+    end_nodes = list(nodes[1:1 + n_end])
+    _env = __import__('os').environ
+    if _env.get('NO_FORK_POSITION'):
+        return paths
+    _skip = {'l1': _env.get('SKIP_L1'), 'l2': _env.get('SKIP_L2'), 'l5': _env.get('SKIP_L5'), 'x': _env.get('SKIP_X')}
+    for _ in range(80):
+        adj, node_list, idx, G = _tree_graph(rm, paths)
+        if not adj:
+            break
+        forks = [n for n in node_list if len(adj[n]) >= 3 and n not in all_terminals]
+        if not forks:
+            break
+        d_clip = _multisource(G, idx, clip_nodes)      # 节点到最近卡扣弧长
+        d_end = _multisource(G, idx, end_nodes)        # 节点到最近终点弧长
+        dist = {F: dijkstra(G, directed=False, indices=[idx[F]], min_only=True) for F in forks}
         moved = False
         for F in forks:
-            d_f = min(float(np.linalg.norm(rm.pos(F) - rm.pos(cn))) for cn in clip_nodes)
-            if d_f >= l5:
+            deg = len(adj[F])
+            dF_clip, dF_end = d_clip[F], d_end[F]
+            others = [o for o in forks if o != F]
+            dF_fork = min((dist[F][idx[o]] for o in others), default=np.inf)
+            N = None
+            if not _skip['x'] and deg > x:
+                # x：度数超限，合并到最近的叶子邻居（降一度）
+                leaves = [n for n in adj[F] if len(adj[n]) == 1]
+                cand = leaves or adj[F]
+                N = min(cand, key=lambda n: np.linalg.norm(rm.pos(n) - rm.pos(F)))
+            elif not _skip['l5'] and dF_clip < l5:
+                # l5：离卡扣太近，合并到离卡扣最远的邻居（避免合并后度数超 x）
+                cand = [n for n in adj[F] if len(adj[n]) + deg - 2 <= x]
+                if cand:
+                    N = max(cand, key=lambda n: d_clip[n])
+                    if d_clip[N] <= dF_clip:
+                        N = None
+                else:
+                    N = None
+            elif not _skip['l1'] and dF_end < l1:
+                # l1：离终点太近（末端分支太短），合并到离终点最远的邻居（避免超 x）
+                cand = [n for n in adj[F] if len(adj[n]) + deg - 2 <= x]
+                if cand:
+                    N = max(cand, key=lambda n: d_end[n])
+                    if d_end[N] <= dF_end:
+                        N = None
+                else:
+                    N = None
+            elif not _skip['l2'] and dF_fork < l2:
+                # l2：分叉间距太近。可合并则「合并近分叉」（零膨胀）；
+                # 合并会超 x 时「拉开」：把分叉朝 other 反方向合并到穿行点邻居
+                # （穿行点变分叉，degree 不变，不超 x，且把间距拉开）。
+                other = min(others, key=lambda o: dist[F][idx[o]])
+                if deg + len(adj[other]) - 2 <= x:
+                    N = min(adj[F], key=lambda n: dist[other][idx[n]])
+                    if dist[other][idx[N]] >= dist[other][idx[F]]:
+                        N = None
+                else:
+                    cand = [n for n in adj[F] if len(adj[n]) == 2 and n not in all_terminals]
+                    if cand:
+                        N = max(cand, key=lambda n: dist[other][idx[n]])
+                        if dist[other][idx[N]] <= dist[other][idx[F]]:
+                            N = None
+                    else:
+                        N = None
+            else:
                 continue
-            nbs = sorted(adj[F], key=lambda n: -min(float(np.linalg.norm(rm.pos(n) - rm.pos(cn)))
-                                                    for cn in clip_nodes))
-            N = nbs[0]  # 离卡扣最远的邻居
+            if N is None:
+                continue
             for eid, p in list(paths.items()):
                 if F not in p:
                     continue
@@ -41,7 +148,6 @@ def _slide_forks_away_from_clips(rm, paths, nodes, all_terminals, n_end, l5):
                     new_p[i] = N
                 paths[eid] = new_p
             moved = True
-            break
         if not moved:
             break
     return paths
@@ -76,19 +182,68 @@ def steiner(rm, case):
         if p:
             for u, v in zip(p[:-1], p[1:]):
                 edges.add((min(u, v), max(u, v)))
-    # 终点挂叶子：接到最近的非终端树节点（避免挂到卡扣/终点上，保持卡扣 degree=2）
+    # 终点挂叶子：接到满足约束的树节点
+    #   硬约束：x 度数≤x、l1 末端分支≥l1（挂点离终点 ≥l1）、l2 建分叉时相邻分叉≥l2
+    #   优先级：先满足 l1 的挂点（分叉点迎合终点移动），兜底取最近
+    from .fork_constraints import read_fork_params
+    _fp = read_fork_params(case)
+    _x, _l1, _l2 = _fp['x'], _fp['l1'], _fp['l2']
     tree_nodes = {start_term}
     for u, v in edges:
         tree_nodes.add(u); tree_nodes.add(v)
+    deg = {}
+    for u, v in edges:
+        deg[u] = deg.get(u, 0) + 1
+        deg[v] = deg.get(v, 0) + 1
     for en in end_terms:
         dist, pred = dijkstra(rm.graph(), indices=[en], return_predecessors=True)
         dist = dist[0]; pred = pred[0]
+        _nl, _ix, _G = _edges_to_graph(rm, edges)
+        forks_now = [n for n in _nl if deg.get(n, 0) >= 3 and n not in all_terminals]
+        fork_set = set(forks_now)
+        d_fork_tree = _multisource(_G, _ix, forks_now)
+
+        def first_fork_euclid(tn):
+            # 末端分支长度 = en 到「最近分叉」的欧氏（tn 挂上去后自身也是分叉候选）
+            d_tn = float(np.linalg.norm(rm.pos(en) - rm.pos(tn)))
+            cur = tn
+            while cur != en and cur >= 0:
+                if cur in fork_set and cur != tn:
+                    return min(d_tn, float(np.linalg.norm(rm.pos(en) - rm.pos(cur))))
+                cur = int(pred[cur])
+            return d_tn
+
         best, best_d = None, np.inf
+        _l1_need = _l1 + 2.0  # 欧氏≥l1 再加 2mm 余量，抵消平滑重采样误差
+        # 候选 1：复用现有分叉（degree<x）且末端分支 ≥l1
+        for f in forks_now:
+            if deg.get(f, 0) >= _x:
+                continue
+            if first_fork_euclid(f) < _l1_need:
+                continue
+            if dist[f] < best_d:
+                best_d, best = dist[f], f
+        # 候选 2：新建普通点，末端分支 ≥l1 且 l2（新建分叉离现有分叉 ≥l2）
         for tn in tree_nodes:
-            if tn in all_terminals:
+            if tn in all_terminals or deg.get(tn, 0) >= _x:
+                continue
+            if first_fork_euclid(tn) < _l1_need:
+                continue
+            if deg.get(tn, 0) < 3 and d_fork_tree.get(tn, np.inf) < _l2:
                 continue
             if dist[tn] < best_d:
                 best_d, best = dist[tn], tn
+        if best is None:
+            for f in forks_now:
+                if deg.get(f, 0) >= _x:
+                    continue
+                if dist[f] < best_d:
+                    best_d, best = dist[f], f
+            for tn in tree_nodes:
+                if tn in all_terminals or deg.get(tn, 0) >= _x:
+                    continue
+                if dist[tn] < best_d:
+                    best_d, best = dist[tn], tn
         if best is not None and np.isfinite(best_d):
             path = [best]; cur = best
             while cur != en:
@@ -98,6 +253,8 @@ def steiner(rm, case):
                 path.append(cur)
             for u, v in zip(path[:-1], path[1:]):
                 edges.add((min(u, v), max(u, v)))
+                deg[u] = deg.get(u, 0) + 1
+                deg[v] = deg.get(v, 0) + 1
 
     # 4. 建父指针 + 每条终点路径
     adj = {}
@@ -207,9 +364,9 @@ def steiner(rm, case):
             if pa is not None and pb is not None:
                 paths[best_eid] = p[:i + 1] + pa[1:] + pb[1:] + p[nxt + 1:]
 
-    # 5.5 分叉点滑移：把离卡扣 < l5 的分叉点合并到更远的邻居（保证 l5 卡扣到分叉距离）
-    l5 = float(case['prefs'].get('clip_min_distance_to_split_mm', 40))
-    paths = _slide_forks_away_from_clips(rm, paths, nodes, all_terminals, n_end, l5)
+    # 5.5 分叉点定位：分叉点迎合卡扣/终点/其他分叉移动，满足 l1/l2/l5/x 硬约束
+    _fp = read_fork_params(case)
+    paths = _position_forks(rm, paths, nodes, all_terminals, n_end, _fp)
 
     # 6. 从最终线束路径重建树，得到与路径一致的分叉点
     final_edges = set()
@@ -265,10 +422,23 @@ def select_spaced_clips(case, topology, covered, minimum_distance=60.0):
                        shape=(len(topology['control_points']),) * 2)
     nodes = [exported['control_point_id'] for _, exported in candidates]
     distances = dijkstra(graph, directed=False, indices=nodes)[:, nodes]
-    pairs = [(i, j, float(distances[i, j])) for i in range(len(candidates))
-             for j in range(i + 1, len(candidates)) if np.isfinite(distances[i, j])]
-    nearest = min((distance for _, _, distance in pairs), default=None)
-    conflicts = [(i, j, distance) for i, j, distance in pairs if distance < minimum_distance]
+    # 相邻卡扣对：同一 harness 路径上连续的卡扣（中间没有其他卡扣才算相邻）
+    clip_index = {cp: i for i, cp in enumerate(nodes)}
+    adjacent = {}
+    for h in topology['harnesses']:
+        last_clip = None
+        for cp in h['cp_sequence']:
+            if cp not in clip_index:
+                continue
+            if last_clip is not None:
+                i, j = clip_index[last_clip], clip_index[cp]
+                a, b = (i, j) if i < j else (j, i)
+                d = float(distances[a, b])
+                adjacent[(a, b)] = min(adjacent.get((a, b), np.inf), d)
+            last_clip = cp
+    pairs = [(i, j, d) for (i, j), d in adjacent.items() if np.isfinite(d)]
+    nearest = min((d for _, _, d in pairs), default=None)
+    conflicts = [(i, j, d) for i, j, d in pairs if d < minimum_distance]
     if not conflicts:
         return [], nearest
 

@@ -21,6 +21,7 @@ import numpy as np
 from harness_plan.data_layer import load_case, params, Collision, unit, SurfacePreference
 from harness_plan.map_layer import Roadmap
 from harness_plan.topology_layer import steiner, select_spaced_clips
+from harness_plan.fork_constraints import read_fork_params, detect_fork_violations
 from harness_plan.smooth_layer import smooth_network
 from harness_plan.result_layer import build_topology, format_result
 
@@ -79,6 +80,8 @@ def route(case_dir, voxel=None, input_file=None, out=None, turn_w=30.0,
             used_clips.append(covered)
         topo, hp = build_topology(case, rm, paths, nodes, parent, harness_paths, metrics, unreached,
                                   col=col, clearance=p['clearance'], path_samples=path_samples)
+        fork_params = read_fork_params(case)
+        fork_violations = detect_fork_violations(topo, fork_params)
         l3 = float(case['prefs'].get('clip_min_spacing_mm', 100))
         excluded, final_minimum = select_spaced_clips(case, topo, used_clips, minimum_distance=l3)
         if not excluded:
@@ -165,6 +168,12 @@ def route(case_dir, voxel=None, input_file=None, out=None, turn_w=30.0,
                                     l4_max_mm=l4, supplement_gaps=supplement_gaps),
                                 fork_distance_summary=dict(
                                     l5_min_mm=l5, violations=fork_to_clip_violations),
+                                fork_constraint_summary=dict(
+                                    params=fork_params,
+                                    violations=fork_violations,
+                                    by_constraint={c: sum(1 for v in fork_violations
+                                                          if v['constraint'] == c)
+                                                   for c in ('l1', 'l2', 'l5', 'l6', 'x')}),
                                 clip_support_issues=[],
                                 clip_support_summary=dict(used=sum(used_clips),
                                                           total=len(case['clips']))),
