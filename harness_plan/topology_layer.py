@@ -62,6 +62,40 @@ def _root_parent(adj, root):
     return parent
 
 
+def _second_mst(rm, paths, nodes, all_terminals, l2):
+    """第二次 MST：分叉点 MST，合并 MST 边 <l2 的近分叉（复用分叉，修正分叉结构）。"""
+    edges = set()
+    for p in paths.values():
+        for u, v in zip(p[:-1], p[1:]):
+            edges.add((min(u, v), max(u, v)))
+    adj = {}
+    for u, v in edges:
+        adj.setdefault(u, []).append(v); adj.setdefault(v, []).append(u)
+    forks = [n for n in adj if len(adj[n]) >= 3 and n not in all_terminals]
+    if len(forks) < 2:
+        return paths
+    D = rm.pair(forks)
+    mst = minimum_spanning_tree(csr_matrix(np.where(np.isfinite(D), D, 0.0))).tocoo()
+    pairs = [(int(forks[a]), int(forks[b])) for a, b in zip(mst.row, mst.col) if D[a, b] < l2]
+    fs = set(forks)
+    for fa, fb in pairs:
+        # 复用分叉：fb 的直接终点（fb 之后无分叉）改挂 fa
+        for eid, p in list(paths.items()):
+            if fb not in p:
+                continue
+            i = p.index(fb)
+            if any(n in fs and n != fb for n in p[i + 1:]):
+                continue
+            if fa not in p:
+                continue
+            j = p.index(fa)
+            seg = rm.path(fa, p[-1])
+            if seg is None:
+                continue
+            paths[eid] = p[:j] + seg[1:]
+    return paths
+
+
 def _position_forks(rm, paths, nodes, all_terminals, n_end, params):
     """分叉点定位：把违规分叉点滑移（合并到更合适的邻居），满足 l1/l2/l5/x。
 
@@ -154,7 +188,8 @@ def _position_forks(rm, paths, nodes, all_terminals, n_end, params):
 
 
 def steiner(rm, case):
-    """骨架由终点决定（MST 在 start+ends 上），卡扣退成 degree-2 waypoint 强制穿行。
+    """方法一（整体草稿，Dijkstra + 两次 MST）：第一次 MST 卡扣主干 → 终点挂叶子
+    → 卡扣三级改道 → 第二次 MST 分叉重排 → 分叉约束。
 
     约束：终点是叶子（degree=1）、卡扣是穿行点（degree=2）、分叉只落在自由体素。
     """
@@ -364,8 +399,11 @@ def steiner(rm, case):
             if pa is not None and pb is not None:
                 paths[best_eid] = p[:i + 1] + pa[1:] + pb[1:] + p[nxt + 1:]
 
-    # 5.5 分叉点定位：分叉点迎合卡扣/终点/其他分叉移动，满足 l1/l2/l5/x 硬约束
+    # 5.5 第二次 MST 分叉重排：MST 判定近分叉对并合并（整体草稿后修正分叉结构）
     _fp = read_fork_params(case)
+    paths = _second_mst(rm, paths, nodes, all_terminals, _fp['l2'])
+
+    # 5.6 分叉点定位：分叉点迎合卡扣/终点/其他分叉移动，满足 l1/l2/l5/x 硬约束
     paths = _position_forks(rm, paths, nodes, all_terminals, n_end, _fp)
 
     # 6. 从最终线束路径重建树，得到与路径一致的分叉点
