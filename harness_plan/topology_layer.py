@@ -154,7 +154,7 @@ def _position_forks(rm, paths, nodes, all_terminals, n_end, params):
 
 
 def steiner(rm, case):
-    """骨架由终点决定（MST 在 start+ends 上），卡扣退成 degree-2 waypoint 强制穿行。
+    """方法二（卡扣先行）：Dijkstra 贪心顺序连卡扣主干，终点挂叶子，卡扣三级改道穿行。
 
     约束：终点是叶子（degree=1）、卡扣是穿行点（degree=2）、分叉只落在自由体素。
     """
@@ -171,17 +171,20 @@ def steiner(rm, case):
     nodes = [start_term] + end_terms + clip_terms
     all_terminals = set(nodes)
 
-    # 2. MST 主干 = {start + clips}：卡扣天然在主干上（= 穿行），分叉落在卡扣的体素上
-    #    终点作为叶子挂接（不参与 MST，避免被当穿行点）
-    trunk_nodes = [start_term] + clip_terms
-    D = rm.pair(trunk_nodes)
-    mst = minimum_spanning_tree(csr_matrix(np.where(np.isfinite(D), D, 0.0))).tocoo()
+    # 2. 卡扣先行：Dijkstra 贪心最近邻顺序连卡扣主干
+    #    卡扣天然在主干上（= 穿行），终点作为叶子后挂
+    unvisited = set(clip_terms)
+    cur = start_term
     edges = set()
-    for a, b in zip(mst.row, mst.col):
-        p = rm.path(trunk_nodes[a], trunk_nodes[b])
+    while unvisited:
+        dist = dijkstra(rm.graph(), indices=[cur], min_only=True)
+        nearest = min(unvisited, key=lambda c: dist[c])
+        p = rm.path(cur, nearest)
         if p:
             for u, v in zip(p[:-1], p[1:]):
                 edges.add((min(u, v), max(u, v)))
+        unvisited.remove(nearest)
+        cur = nearest
     # 终点挂叶子：接到满足约束的树节点
     #   硬约束：x 度数≤x、l1 末端分支≥l1（挂点离终点 ≥l1）、l2 建分叉时相邻分叉≥l2
     #   优先级：先满足 l1 的挂点（分叉点迎合终点移动），兜底取最近
